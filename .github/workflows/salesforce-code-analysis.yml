@@ -1,0 +1,251 @@
+# Salesforce Code Analysis Workflow
+# Generated using GenAI tool: Codify - Please review for accuracy
+
+name: Salesforce Code Analysis
+
+on:
+  pull_request:
+    branches: [ main, develop ]
+    paths: 
+      - 'force-app/**'
+      - 'sfdx-project.json'
+      - '**/*.cls'
+      - '**/*.trigger'
+      - '**/*.js'
+      - '**/*.html'
+      - '**/*.css'
+
+jobs:
+  code-analysis:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      pull-requests: write
+      checks: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '11'
+
+      - name: Install Salesforce CLI
+        run: |
+          npm install -g @salesforce/cli
+          sf version
+
+      - name: Install Salesforce Code Analyzer
+        run: |
+          sf plugins install @salesforce/sfdx-scanner
+          sf scanner rule list
+
+      - name: Run Comprehensive Code Analysis
+        id: scan
+        run: |
+          # Create output directory
+          mkdir -p analysis-results
+          
+          # Run PMD analysis for Apex
+          echo "Running PMD analysis..."
+          sf scanner run --format sarif --target "force-app/**/*.cls,force-app/**/*.trigger" \
+            --engine pmd --category "Best Practices,Code Style,Design,Documentation,Error Prone,Multithreading,Performance,Security" \
+            --outfile analysis-results/pmd-results.sarif || true
+          
+          # Run ESLint analysis for LWC
+          echo "Running ESLint analysis..."
+          sf scanner run --format sarif --target "force-app/**/lwc/**/*.js" \
+            --engine eslint-lwc \
+            --outfile analysis-results/eslint-results.sarif || true
+          
+          # Run comprehensive analysis with all engines
+          echo "Running comprehensive analysis..."
+          sf scanner run --format sarif --target "force-app/" \
+            --engine pmd,eslint-lwc,retire-js \
+            --category "Best Practices,Code Style,Design,Documentation,Error Prone,Multithreading,Performance,Security" \
+            --severity-threshold 2 \
+            --outfile analysis-results/comprehensive-results.sarif || true
+          
+          # Generate JSON report for PR comments
+          sf scanner run --format json --target "force-app/" \
+            --engine pmd,eslint-lwc,retire-js \
+            --category "Best Practices,Code Style,Design,Documentation,Error Prone,Multithreading,Performance,Security" \
+            --outfile analysis-results/detailed-results.json || true
+          
+          echo "Analysis completed"
+
+      - name: Upload SARIF Results to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: analysis-results/comprehensive-results.sarif
+          category: salesforce-analysis
+
+      - name: Process Analysis Results
+        id: process-results
+        run: |
+          # Check if results file exists and has content
+          if [ -f "analysis-results/detailed-results.json" ] && [ -s "analysis-results/detailed-results.json" ]; then
+            # Count violations by severity
+            HIGH_COUNT=$(jq '[.[] | select(.severity == 1 or .severity == 2)] | length' analysis-results/detailed-results.json || echo "0")
+            MEDIUM_COUNT=$(jq '[.[] | select(.severity == 3)] | length' analysis-results/detailed-results.json || echo "0")
+            LOW_COUNT=$(jq '[.[] | select(.severity == 4 or .severity == 5)] | length' analysis-results/detailed-results.json || echo "0")
+            TOTAL_COUNT=$(jq 'length' analysis-results/detailed-results.json || echo "0")
+            
+            echo "high_count=$HIGH_COUNT" >> $GITHUB_OUTPUT
+            echo "medium_count=$MEDIUM_COUNT" >> $GITHUB_OUTPUT
+            echo "low_count=$LOW_COUNT" >> $GITHUB_OUTPUT
+            echo "total_count=$TOTAL_COUNT" >> $GITHUB_OUTPUT
+            
+            # Check if we should block the PR (high/critical issues)
+            if [ "$HIGH_COUNT" -gt "0" ]; then
+              echo "should_block=true" >> $GITHUB_OUTPUT
+              echo "❌ Found $HIGH_COUNT high/critical severity issues"
+            else
+              echo "should_block=false" >> $GITHUB_OUTPUT
+              echo "✅ No blocking issues found"
+            fi
+          else
+            echo "No analysis results found or empty results"
+            echo "high_count=0" >> $GITHUB_OUTPUT
+            echo "medium_count=0" >> $GITHUB_OUTPUT
+            echo "low_count=0" >> $GITHUB_OUTPUT
+            echo "total_count=0" >> $GITHUB_OUTPUT
+            echo "should_block=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate PR Comment
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            
+            let comment = `## 🔍 Salesforce Code Analysis Results\n\n`;
+            
+            const highCount = '${{ steps.process-results.outputs.high_count }}' || '0';
+            const mediumCount = '${{ steps.process-results.outputs.medium_count }}' || '0';
+            const lowCount = '${{ steps.process-results.outputs.low_count }}' || '0';
+            const totalCount = '${{ steps.process-results.outputs.total_count }}' || '0';
+            const shouldBlock = '${{ steps.process-results.outputs.should_block }}' === 'true';
+            
+            if (shouldBlock) {
+              comment += `### ❌ **BLOCKING ISSUES FOUND**\n\n`;
+              comment += `This PR cannot be merged due to high/critical severity issues.\n\n`;
+            } else if (totalCount > 0) {
+              comment += `### ⚠️ **Issues Found - Review Required**\n\n`;
+            } else {
+              comment += `### ✅ **No Issues Found**\n\n`;
+              comment += `Great job! Your code passes all quality checks.\n\n`;
+            }
+            
+            if (totalCount > 0) {
+              comment += `### 📊 **Summary**\n\n`;
+              comment += `| Severity | Count |\n`;
+              comment += `|----------|-------|\n`;
+              comment += `| 🔴 High/Critical | ${highCount} |\n`;
+              comment += `| 🟡 Medium | ${mediumCount} |\n`;
+              comment += `| 🔵 Low/Info | ${lowCount} |\n`;
+              comment += `| **Total** | **${totalCount}** |\n\n`;
+              
+              // Try to read detailed results for inline comments
+              try {
+                if (fs.existsSync('analysis-results/detailed-results.json')) {
+                  const results = JSON.parse(fs.readFileSync('analysis-results/detailed-results.json', 'utf8'));
+                  
+                  if (results.length > 0) {
+                    comment += `### 📝 **Detailed Issues**\n\n`;
+                    
+                    // Group by file
+                    const fileGroups = {};
+                    results.forEach(issue => {
+                      const fileName = issue.fileName || 'Unknown File';
+                      if (!fileGroups[fileName]) {
+                        fileGroups[fileName] = [];
+                      }
+                      fileGroups[fileName].push(issue);
+                    });
+                    
+                    Object.keys(fileGroups).forEach(fileName => {
+                      comment += `#### 📄 ${fileName}\n\n`;
+                      fileGroups[fileName].forEach(issue => {
+                        const severityIcon = issue.severity <= 2 ? '🔴' : issue.severity === 3 ? '🟡' : '🔵';
+                        const line = issue.line ? `Line ${issue.line}` : 'N/A';
+                        comment += `- ${severityIcon} **${issue.ruleName}** (${line})\n`;
+                        comment += `  - ${issue.message}\n`;
+                        if (issue.category) {
+                          comment += `  - Category: ${issue.category}\n`;
+                        }
+                        comment += `\n`;
+                      });
+                    });
+                  }
+                }
+              } catch (error) {
+                console.log('Error reading detailed results:', error);
+                comment += `_Detailed results could not be processed._\n\n`;
+              }
+              
+              comment += `### 🔗 **Additional Resources**\n\n`;
+              comment += `- 📋 View detailed results in the [Security tab](${context.payload.repository.html_url}/security/code-scanning)\n`;
+              comment += `- 📚 [Salesforce Code Analyzer Documentation](https://forcedotcom.github.io/sfdx-scanner/)\n`;
+              comment += `- 🛠️ [PMD Rules Documentation](https://pmd.github.io/pmd/pmd_rules_apex.html)\n`;
+            }
+            
+            comment += `\n---\n*Analysis performed by Salesforce Code Analyzer on ${new Date().toISOString()}*`;
+            
+            // Find existing comment and update or create new
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            
+            const existingComment = comments.data.find(comment => 
+              comment.body.includes('🔍 Salesforce Code Analysis Results')
+            );
+            
+            if (existingComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingComment.id,
+                body: comment
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: comment
+              });
+            }
+
+      - name: Block PR on Critical Issues
+        if: steps.process-results.outputs.should_block == 'true'
+        run: |
+          echo "❌ Blocking PR due to high/critical severity issues"
+          echo "Found ${{ steps.process-results.outputs.high_count }} high/critical issues"
+          echo "Please review and fix the issues before merging"
+          exit 1
+
+      - name: Upload Analysis Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: salesforce-analysis-results
+          path: analysis-results/
+          retention-days: 30
