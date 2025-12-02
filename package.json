@@ -1,0 +1,25 @@
+{
+  "name": "code-analyzer-fixer",
+  "version": "1.0.0",
+  "description": "Code analyzer and fixer for Salesforce projects",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "analysis": "mkdir -p analysis-results && echo 'Analysis directory created'",
+    "postinstall": "echo 'Dependencies installed successfully'"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/your-repo/code-analyzer-fixer.git"
+  },
+  "keywords": ["salesforce", "code-analysis", "automation"],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@salesforce/cli": "^2.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=8.0.0"
+  }
+}
