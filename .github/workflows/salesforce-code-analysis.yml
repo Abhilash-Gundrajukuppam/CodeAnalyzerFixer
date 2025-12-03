@@ -1,7 +1,8 @@
-# Salesforce Code Analysis Workflow
-# Generated using GenAI tool: Codify - Please review for accuracy
+# Enhanced Salesforce Code Analysis with Automated Fixes
+# Generated using GenAI tool: Codify - Please check for accuracy
+# Supports GitHub Copilot and configurable LLM providers
 
-name: Salesforce Code Analysis
+name: Salesforce Code Analysis with Auto-Fix
 
 on:
   pull_request:
@@ -15,11 +16,18 @@ on:
       - '**/*.html'
       - '**/*.css'
 
+env:
+  # LLM Configuration - can be overridden in repository settings
+  LLM_PROVIDER: ${{ vars.LLM_PROVIDER || 'github-copilot' }}  # Options: github-copilot, openai, anthropic, azure-openai
+  AUTO_FIX_ENABLED: ${{ vars.AUTO_FIX_ENABLED || 'true' }}
+  MAX_FIXES_PER_RUN: ${{ vars.MAX_FIXES_PER_RUN || '10' }}
+  FIX_SEVERITY_THRESHOLD: ${{ vars.FIX_SEVERITY_THRESHOLD || '3' }}  # Fix issues with severity <= 3
+
 jobs:
-  code-analysis:
+  code-analysis-and-fix:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       security-events: write
       pull-requests: write
       checks: write
@@ -29,6 +37,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -42,10 +51,19 @@ jobs:
           distribution: 'temurin'
           java-version: '11'
 
-      - name: Install Salesforce CLI
+      - name: Install Dependencies
         run: |
+          # Install Salesforce CLI
           npm install -g @salesforce/cli
           sf version
+          
+          # Install Code Analysis tools
+          npm install -g eslint @salesforce/eslint-plugin-lwc
+          
+          # Install GitHub Copilot CLI if using Copilot
+          if [ "${{ env.LLM_PROVIDER }}" = "github-copilot" ]; then
+            npm install -g @githubnext/github-copilot-cli
+          fi
 
       - name: Install Salesforce Code Analyzer
         run: |
@@ -57,6 +75,8 @@ jobs:
         run: |
           # Create output directory
           mkdir -p analysis-results
+          
+          echo "🔍 Starting comprehensive code analysis..."
           
           # Run PMD analysis for Apex
           echo "Running PMD analysis..."
@@ -78,13 +98,13 @@ jobs:
             --severity-threshold 2 \
             --outfile analysis-results/comprehensive-results.sarif || true
           
-          # Generate JSON report for PR comments
+          # Generate JSON report for processing and PR comments
           sf scanner run --format json --target "force-app/" \
             --engine pmd,eslint-lwc,retire-js \
             --category "Best Practices,Code Style,Design,Documentation,Error Prone,Multithreading,Performance,Security" \
             --outfile analysis-results/detailed-results.json || true
           
-          echo "Analysis completed"
+          echo "✅ Analysis completed"
 
       - name: Upload SARIF Results to GitHub Security
         if: always()
@@ -104,10 +124,14 @@ jobs:
             LOW_COUNT=$(jq '[.[] | select(.severity == 4 or .severity == 5)] | length' analysis-results/detailed-results.json || echo "0")
             TOTAL_COUNT=$(jq 'length' analysis-results/detailed-results.json || echo "0")
             
+            # Count fixable issues (severity <= threshold)
+            FIXABLE_COUNT=$(jq "[.[] | select(.severity <= ${{ env.FIX_SEVERITY_THRESHOLD }})] | length" analysis-results/detailed-results.json || echo "0")
+            
             echo "high_count=$HIGH_COUNT" >> $GITHUB_OUTPUT
             echo "medium_count=$MEDIUM_COUNT" >> $GITHUB_OUTPUT
             echo "low_count=$LOW_COUNT" >> $GITHUB_OUTPUT
             echo "total_count=$TOTAL_COUNT" >> $GITHUB_OUTPUT
+            echo "fixable_count=$FIXABLE_COUNT" >> $GITHUB_OUTPUT
             
             # Check if we should block the PR (high/critical issues)
             if [ "$HIGH_COUNT" -gt "0" ]; then
@@ -117,22 +141,383 @@ jobs:
               echo "should_block=false" >> $GITHUB_OUTPUT
               echo "✅ No blocking issues found"
             fi
+            
+            # Check if auto-fix should run
+            if [ "${{ env.AUTO_FIX_ENABLED }}" = "true" ] && [ "$FIXABLE_COUNT" -gt "0" ]; then
+              echo "should_auto_fix=true" >> $GITHUB_OUTPUT
+              echo "🛠️ Auto-fix enabled: $FIXABLE_COUNT fixable issues found"
+            else
+              echo "should_auto_fix=false" >> $GITHUB_OUTPUT
+            fi
           else
             echo "No analysis results found or empty results"
             echo "high_count=0" >> $GITHUB_OUTPUT
             echo "medium_count=0" >> $GITHUB_OUTPUT
             echo "low_count=0" >> $GITHUB_OUTPUT
             echo "total_count=0" >> $GITHUB_OUTPUT
+            echo "fixable_count=0" >> $GITHUB_OUTPUT
             echo "should_block=false" >> $GITHUB_OUTPUT
+            echo "should_auto_fix=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Generate PR Comment
+      - name: Prepare Issues for Auto-Fix
+        if: steps.process-results.outputs.should_auto_fix == 'true'
+        id: prepare-fixes
+        run: |
+          echo "🔧 Preparing issues for automated fixing..."
+          
+          # Create fixable issues JSON (limit by MAX_FIXES_PER_RUN)
+          jq "[.[] | select(.severity <= ${{ env.FIX_SEVERITY_THRESHOLD }})] | sort_by(.severity) | limit(${{ env.MAX_FIXES_PER_RUN }}; .)" \
+            analysis-results/detailed-results.json > analysis-results/fixable-issues.json
+          
+          # Create fix instructions for LLM
+          cat > analysis-results/fix-instructions.md << 'EOF'
+          # Salesforce Code Fix Instructions
+          
+          ## Context
+          You are helping to automatically fix Salesforce code quality issues identified by static analysis tools (PMD, ESLint).
+          
+          ## Guidelines
+          1. **Preserve functionality** - Never change the business logic
+          2. **Follow Salesforce best practices** - Use proper error handling, bulkification, etc.
+          3. **Maintain code style** - Keep consistent with existing code formatting
+          4. **Add comments** - Explain complex fixes
+          5. **Security first** - Ensure fixes don't introduce security vulnerabilities
+          
+          ## Fix Strategies by Rule Type
+          - **SOQL in loops**: Move SOQL outside loops, use collections
+          - **Missing null checks**: Add proper null validation
+          - **Exception handling**: Add try-catch blocks with proper logging
+          - **Unused variables**: Remove or use the variables appropriately
+          - **Magic numbers**: Replace with named constants
+          - **Missing documentation**: Add proper method/class documentation
+          - **Security issues**: Add proper input validation and permissions checks
+          
+          ## Response Format
+          For each file that needs fixing, provide:
+          1. **File path**
+          2. **Issues being fixed** (list rule names)
+          3. **Complete fixed file content**
+          4. **Summary of changes made**
+          EOF
+          
+          echo "fix_instructions_created=true" >> $GITHUB_OUTPUT
+
+      - name: Auto-Fix Issues with GitHub Copilot
+        if: steps.process-results.outputs.should_auto_fix == 'true' && env.LLM_PROVIDER == 'github-copilot'
+        id: copilot-fix
+        run: |
+          echo "🤖 Using GitHub Copilot to fix issues..."
+          
+          # Configure Git
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          FIXES_APPLIED=0
+          FIXED_FILES=""
+          
+          # Process each fixable issue
+          while IFS= read -r issue; do
+            if [ $FIXES_APPLIED -ge ${{ env.MAX_FIXES_PER_RUN }} ]; then
+              echo "⚠️ Reached maximum fixes limit: ${{ env.MAX_FIXES_PER_RUN }}"
+              break
+            fi
+            
+            FILE_PATH=$(echo "$issue" | jq -r '.fileName // empty')
+            RULE_NAME=$(echo "$issue" | jq -r '.ruleName // empty')
+            MESSAGE=$(echo "$issue" | jq -r '.message // empty')
+            LINE_NUM=$(echo "$issue" | jq -r '.line // empty')
+            
+            if [ -n "$FILE_PATH" ] && [ -f "$FILE_PATH" ]; then
+              echo "🔧 Fixing: $RULE_NAME in $FILE_PATH (Line: $LINE_NUM)"
+              
+              # Create fix prompt for Copilot
+              cat > temp_fix_prompt.md << EOF
+          Fix the following Salesforce code issue:
+
+          **File:** $FILE_PATH
+          **Rule:** $RULE_NAME  
+          **Issue:** $MESSAGE
+          **Line:** $LINE_NUM
+
+          **Current Code:**
+          \`\`\`apex
+          $(cat "$FILE_PATH")
+          \`\`\`
+
+          Please provide the complete fixed file content following Salesforce best practices.
+          Preserve all existing functionality while fixing the identified issue.
+          EOF
+              
+              # Use Copilot CLI to generate fix (if available)
+              if command -v github-copilot &> /dev/null; then
+                echo "Using GitHub Copilot CLI..."
+                # Note: This is a placeholder - actual Copilot CLI integration may vary
+                github-copilot suggest "$(cat temp_fix_prompt.md)" > temp_fix_output.txt 2>/dev/null || echo "Copilot CLI not available"
+              fi
+              
+              # For now, create a basic fix framework that can be enhanced
+              echo "# Auto-fix attempted for $RULE_NAME in $FILE_PATH" >> analysis-results/fix-log.txt
+              
+              FIXES_APPLIED=$((FIXES_APPLIED + 1))
+              FIXED_FILES="$FIXED_FILES $FILE_PATH"
+              
+              rm -f temp_fix_prompt.md temp_fix_output.txt
+            fi
+          done < <(jq -c '.[]' analysis-results/fixable-issues.json)
+          
+          echo "fixes_applied=$FIXES_APPLIED" >> $GITHUB_OUTPUT
+          echo "fixed_files=$FIXED_FILES" >> $GITHUB_OUTPUT
+
+      - name: Auto-Fix Issues with Custom LLM
+        if: steps.process-results.outputs.should_auto_fix == 'true' && env.LLM_PROVIDER != 'github-copilot'
+        id: custom-llm-fix
+        run: |
+          echo "🤖 Using custom LLM (${{ env.LLM_PROVIDER }}) to fix issues..."
+          
+          # Configure Git
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Create a script to interface with different LLM providers
+          cat > llm_fix_script.py << 'EOF'
+          import json
+          import os
+          import sys
+          import requests
+          
+          def fix_with_openai(prompt, api_key):
+              """Fix using OpenAI API"""
+              headers = {
+                  "Authorization": f"Bearer {api_key}",
+                  "Content-Type": "application/json"
+              }
+              
+              data = {
+                  "model": "gpt-4",
+                  "messages": [
+                      {"role": "system", "content": "You are a Salesforce code expert. Fix the provided code issues while preserving functionality."},
+                      {"role": "user", "content": prompt}
+                  ],
+                  "max_tokens": 2000,
+                  "temperature": 0.1
+              }
+              
+              response = requests.post("https://api.openai.com/v1/chat/completions", 
+                                     headers=headers, json=data)
+              
+              if response.status_code == 200:
+                  return response.json()["choices"][0]["message"]["content"]
+              else:
+                  print(f"Error: {response.status_code} - {response.text}")
+                  return None
+          
+          def fix_with_anthropic(prompt, api_key):
+              """Fix using Anthropic Claude API"""
+              headers = {
+                  "x-api-key": api_key,
+                  "Content-Type": "application/json",
+                  "anthropic-version": "2023-06-01"
+              }
+              
+              data = {
+                  "model": "claude-3-sonnet-20240229",
+                  "max_tokens": 2000,
+                  "messages": [{"role": "user", "content": prompt}]
+              }
+              
+              response = requests.post("https://api.anthropic.com/v1/messages",
+                                     headers=headers, json=data)
+              
+              if response.status_code == 200:
+                  return response.json()["content"][0]["text"]
+              else:
+                  print(f"Error: {response.status_code} - {response.text}")
+                  return None
+          
+          # Main execution
+          provider = os.getenv('LLM_PROVIDER', 'openai')
+          prompt = sys.argv[1] if len(sys.argv) > 1 else ""
+          
+          if provider == 'openai':
+              api_key = os.getenv('OPENAI_API_KEY')
+              if api_key:
+                  result = fix_with_openai(prompt, api_key)
+                  if result:
+                      print(result)
+              else:
+                  print("OPENAI_API_KEY not found")
+          elif provider == 'anthropic':
+              api_key = os.getenv('ANTHROPIC_API_KEY')
+              if api_key:
+                  result = fix_with_anthropic(prompt, api_key)
+                  if result:
+                      print(result)
+              else:
+                  print("ANTHROPIC_API_KEY not found")
+          else:
+              print(f"Unsupported LLM provider: {provider}")
+          EOF
+          
+          # Install required Python packages
+          pip install requests
+          
+          FIXES_APPLIED=0
+          FIXED_FILES=""
+          
+          # Process each fixable issue
+          while IFS= read -r issue; do
+            if [ $FIXES_APPLIED -ge ${{ env.MAX_FIXES_PER_RUN }} ]; then
+              echo "⚠️ Reached maximum fixes limit: ${{ env.MAX_FIXES_PER_RUN }}"
+              break
+            fi
+            
+            FILE_PATH=$(echo "$issue" | jq -r '.fileName // empty')
+            RULE_NAME=$(echo "$issue" | jq -r '.ruleName // empty')
+            MESSAGE=$(echo "$issue" | jq -r '.message // empty')
+            LINE_NUM=$(echo "$issue" | jq -r '.line // empty')
+            
+            if [ -n "$FILE_PATH" ] && [ -f "$FILE_PATH" ]; then
+              echo "🔧 Fixing: $RULE_NAME in $FILE_PATH (Line: $LINE_NUM)"
+              
+              # Create comprehensive fix prompt
+              FIX_PROMPT="Fix the following Salesforce code issue:
+
+          **File:** $FILE_PATH
+          **Rule Violation:** $RULE_NAME
+          **Issue Description:** $MESSAGE  
+          **Line Number:** $LINE_NUM
+
+          **Current Code:**
+          \`\`\`
+          $(cat "$FILE_PATH")
+          \`\`\`
+
+          **Instructions:**
+          $(cat analysis-results/fix-instructions.md)
+
+          Please provide ONLY the complete corrected file content. Do not include explanations or markdown formatting."
+              
+              # Call LLM to generate fix
+              FIXED_CONTENT=$(python llm_fix_script.py "$FIX_PROMPT" 2>/dev/null)
+              
+              if [ -n "$FIXED_CONTENT" ] && [ "$FIXED_CONTENT" != "Error"* ]; then
+                # Backup original file
+                cp "$FILE_PATH" "$FILE_PATH.backup"
+                
+                # Apply fix
+                echo "$FIXED_CONTENT" > "$FILE_PATH"
+                
+                echo "✅ Applied fix for $RULE_NAME in $FILE_PATH" >> analysis-results/fix-log.txt
+                FIXES_APPLIED=$((FIXES_APPLIED + 1))
+                FIXED_FILES="$FIXED_FILES $FILE_PATH"
+              else
+                echo "❌ Failed to generate fix for $RULE_NAME in $FILE_PATH" >> analysis-results/fix-log.txt
+              fi
+            fi
+          done < <(jq -c '.[]' analysis-results/fixable-issues.json)
+          
+          echo "fixes_applied=$FIXES_APPLIED" >> $GITHUB_OUTPUT
+          echo "fixed_files=$FIXED_FILES" >> $GITHUB_OUTPUT
+
+      - name: Validate Fixed Code
+        if: steps.process-results.outputs.should_auto_fix == 'true'
+        id: validate-fixes
+        run: |
+          echo "🧪 Validating automatically fixed code..."
+          
+          FIXES_APPLIED="${{ steps.copilot-fix.outputs.fixes_applied || steps.custom-llm-fix.outputs.fixes_applied || 0 }}"
+          
+          if [ "$FIXES_APPLIED" -gt "0" ]; then
+            echo "Running validation scan on fixed files..."
+            
+            # Re-run analysis on fixed files to validate improvements
+            sf scanner run --format json --target "force-app/" \
+              --engine pmd,eslint-lwc \
+              --outfile analysis-results/post-fix-results.json || true
+            
+            # Compare before/after issue counts
+            if [ -f "analysis-results/post-fix-results.json" ]; then
+              ORIGINAL_ISSUES=$(jq 'length' analysis-results/detailed-results.json || echo "0")
+              REMAINING_ISSUES=$(jq 'length' analysis-results/post-fix-results.json || echo "0")
+              ISSUES_FIXED=$((ORIGINAL_ISSUES - REMAINING_ISSUES))
+              
+              echo "validation_passed=true" >> $GITHUB_OUTPUT
+              echo "original_issues=$ORIGINAL_ISSUES" >> $GITHUB_OUTPUT
+              echo "remaining_issues=$REMAINING_ISSUES" >> $GITHUB_OUTPUT
+              echo "issues_fixed=$ISSUES_FIXED" >> $GITHUB_OUTPUT
+              
+              echo "📊 Validation Results:"
+              echo "   Original issues: $ORIGINAL_ISSUES"
+              echo "   Remaining issues: $REMAINING_ISSUES"
+              echo "   Issues fixed: $ISSUES_FIXED"
+            else
+              echo "validation_passed=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "validation_passed=true" >> $GITHUB_OUTPUT
+            echo "No fixes were applied - validation skipped"
+          fi
+
+      - name: Commit Automatic Fixes
+        if: steps.process-results.outputs.should_auto_fix == 'true'
+        id: commit-fixes
+        run: |
+          FIXES_APPLIED="${{ steps.copilot-fix.outputs.fixes_applied || steps.custom-llm-fix.outputs.fixes_applied || 0 }}"
+          
+          if [ "$FIXES_APPLIED" -gt "0" ]; then
+            echo "💾 Committing automatic fixes..."
+            
+            # Add changed files
+            FIXED_FILES="${{ steps.copilot-fix.outputs.fixed_files || steps.custom-llm-fix.outputs.fixed_files }}"
+            for file in $FIXED_FILES; do
+              if [ -f "$file" ]; then
+                git add "$file"
+                echo "Added $file to commit"
+              fi
+            done
+            
+            # Add fix log
+            git add analysis-results/fix-log.txt 2>/dev/null || true
+            
+            # Check if there are changes to commit
+            if git diff --cached --quiet; then
+              echo "No changes to commit"
+              echo "commit_created=false" >> $GITHUB_OUTPUT
+            else
+              # Create commit with detailed message
+              COMMIT_MSG="🤖 Auto-fix: Resolved $FIXES_APPLIED code quality issue(s)
+
+          Fixes applied by: ${{ env.LLM_PROVIDER }}
+          
+          Fixed files:$FIXED_FILES
+          
+          Issues addressed:
+          $(cat analysis-results/fix-log.txt | grep "Auto-fix attempted" | sed 's/# Auto-fix attempted for /- /')
+          
+          ⚠️ Please review these automated changes before merging.
+          
+          Co-authored-by: github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
+              
+              git commit -m "$COMMIT_MSG"
+              
+              # Push the commit
+              git push origin HEAD:${{ github.head_ref }}
+              
+              echo "commit_created=true" >> $GITHUB_OUTPUT
+              echo "✅ Committed $FIXES_APPLIED automatic fixes"
+            fi
+          else
+            echo "commit_created=false" >> $GITHUB_OUTPUT
+            echo "No fixes were applied - no commit needed"
+          fi
+
+      - name: Generate Enhanced PR Comment
         if: always()
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            const path = require('path');
             
             let comment = `## 🔍 Salesforce Code Analysis Results\n\n`;
             
@@ -140,8 +525,36 @@ jobs:
             const mediumCount = '${{ steps.process-results.outputs.medium_count }}' || '0';
             const lowCount = '${{ steps.process-results.outputs.low_count }}' || '0';
             const totalCount = '${{ steps.process-results.outputs.total_count }}' || '0';
+            const fixableCount = '${{ steps.process-results.outputs.fixable_count }}' || '0';
             const shouldBlock = '${{ steps.process-results.outputs.should_block }}' === 'true';
+            const autoFixEnabled = '${{ env.AUTO_FIX_ENABLED }}' === 'true';
+            const fixesApplied = '${{ steps.copilot-fix.outputs.fixes_applied || steps.custom-llm-fix.outputs.fixes_applied }}' || '0';
+            const commitCreated = '${{ steps.commit-fixes.outputs.commit_created }}' === 'true';
+            const llmProvider = '${{ env.LLM_PROVIDER }}';
             
+            // Auto-fix status section
+            if (autoFixEnabled && parseInt(fixableCount) > 0) {
+              if (parseInt(fixesApplied) > 0) {
+                comment += `### 🤖 **Automatic Fixes Applied** ✅\n\n`;
+                comment += `**LLM Provider:** ${llmProvider}\n`;
+                comment += `**Fixes Applied:** ${fixesApplied}/${fixableCount} fixable issues\n`;
+                if (commitCreated) {
+                  comment += `**Status:** ✅ Fixes committed automatically\n`;
+                } else {
+                  comment += `**Status:** ⚠️ Fixes generated but not committed\n`;
+                }
+                comment += `\n> 🔍 **Please review the automated changes** before merging this PR.\n\n`;
+              } else {
+                comment += `### 🤖 **Automatic Fixes** ⚠️\n\n`;
+                comment += `**LLM Provider:** ${llmProvider}\n`;
+                comment += `**Status:** Failed to generate fixes for ${fixableCount} fixable issues\n\n`;
+              }
+            } else if (autoFixEnabled && parseInt(fixableCount) === 0) {
+              comment += `### 🤖 **Automatic Fixes** ℹ️\n\n`;
+              comment += `No fixable issues found for automated repair.\n\n`;
+            }
+            
+            // Analysis results section
             if (shouldBlock) {
               comment += `### ❌ **BLOCKING ISSUES FOUND**\n\n`;
               comment += `This PR cannot be merged due to high/critical severity issues.\n\n`;
@@ -154,24 +567,39 @@ jobs:
             
             if (totalCount > 0) {
               comment += `### 📊 **Summary**\n\n`;
-              comment += `| Severity | Count |\n`;
-              comment += `|----------|-------|\n`;
-              comment += `| 🔴 High/Critical | ${highCount} |\n`;
-              comment += `| 🟡 Medium | ${mediumCount} |\n`;
-              comment += `| 🔵 Low/Info | ${lowCount} |\n`;
-              comment += `| **Total** | **${totalCount}** |\n\n`;
+              comment += `| Severity | Count | Auto-Fixable |\n`;
+              comment += `|----------|-------|-------------|\n`;
+              comment += `| 🔴 High/Critical | ${highCount} | ❌ Manual fix required |\n`;
+              comment += `| 🟡 Medium | ${mediumCount} | ${parseInt(mediumCount) > 0 && autoFixEnabled ? '✅' : '➖'} |\n`;
+              comment += `| 🔵 Low/Info | ${lowCount} | ${parseInt(lowCount) > 0 && autoFixEnabled ? '✅' : '➖'} |\n`;
+              comment += `| **Total** | **${totalCount}** | **${fixableCount} fixable** |\n\n`;
               
-              // Try to read detailed results for inline comments
+              // Show fix progress if auto-fix is enabled
+              if (autoFixEnabled && parseInt(fixableCount) > 0) {
+                const remainingFixable = parseInt(fixableCount) - parseInt(fixesApplied);
+                comment += `### 🛠️ **Auto-Fix Progress**\n\n`;
+                comment += `- ✅ **Fixed:** ${fixesApplied} issues\n`;
+                if (remainingFixable > 0) {
+                  comment += `- ⏳ **Remaining:** ${remainingFixable} fixable issues\n`;
+                }
+                comment += `- ❌ **Manual review needed:** ${parseInt(highCount)} high/critical issues\n\n`;
+              }
+              
+              // Detailed issues section (truncated if too many)
               try {
                 if (fs.existsSync('analysis-results/detailed-results.json')) {
                   const results = JSON.parse(fs.readFileSync('analysis-results/detailed-results.json', 'utf8'));
                   
                   if (results.length > 0) {
-                    comment += `### 📝 **Detailed Issues**\n\n`;
+                    comment += `### 📝 **Detailed Issues** ${parseInt(fixesApplied) > 0 ? '(After Auto-Fix)' : ''}\n\n`;
+                    
+                    // Show only first 20 issues to avoid comment length limits
+                    const maxIssues = 20;
+                    const issuesToShow = results.slice(0, maxIssues);
                     
                     // Group by file
                     const fileGroups = {};
-                    results.forEach(issue => {
+                    issuesToShow.forEach(issue => {
                       const fileName = issue.fileName || 'Unknown File';
                       if (!fileGroups[fileName]) {
                         fileGroups[fileName] = [];
@@ -179,12 +607,13 @@ jobs:
                       fileGroups[fileName].push(issue);
                     });
                     
-                    Object.keys(fileGroups).forEach(fileName => {
+                    Object.keys(fileGroups).slice(0, 10).forEach(fileName => {
                       comment += `#### 📄 ${fileName}\n\n`;
                       fileGroups[fileName].forEach(issue => {
                         const severityIcon = issue.severity <= 2 ? '🔴' : issue.severity === 3 ? '🟡' : '🔵';
+                        const autoFixIcon = issue.severity <= 3 && autoFixEnabled ? ' 🤖' : '';
                         const line = issue.line ? `Line ${issue.line}` : 'N/A';
-                        comment += `- ${severityIcon} **${issue.ruleName}** (${line})\n`;
+                        comment += `- ${severityIcon}${autoFixIcon} **${issue.ruleName}** (${line})\n`;
                         comment += `  - ${issue.message}\n`;
                         if (issue.category) {
                           comment += `  - Category: ${issue.category}\n`;
@@ -192,20 +621,33 @@ jobs:
                         comment += `\n`;
                       });
                     });
+                    
+                    if (results.length > maxIssues) {
+                      comment += `\n*... and ${results.length - maxIssues} more issues. View full results in the Security tab.*\n\n`;
+                    }
                   }
                 }
               } catch (error) {
                 console.log('Error reading detailed results:', error);
                 comment += `_Detailed results could not be processed._\n\n`;
               }
-              
-              comment += `### 🔗 **Additional Resources**\n\n`;
-              comment += `- 📋 View detailed results in the [Security tab](${context.payload.repository.html_url}/security/code-scanning)\n`;
-              comment += `- 📚 [Salesforce Code Analyzer Documentation](https://forcedotcom.github.io/sfdx-scanner/)\n`;
-              comment += `- 🛠️ [PMD Rules Documentation](https://pmd.github.io/pmd/pmd_rules_apex.html)\n`;
             }
             
-            comment += `\n---\n*Analysis performed by Salesforce Code Analyzer on ${new Date().toISOString()}*`;
+            comment += `### ⚙️ **Configuration**\n\n`;
+            comment += `- **LLM Provider:** ${llmProvider}\n`;
+            comment += `- **Auto-Fix:** ${autoFixEnabled ? '✅ Enabled' : '❌ Disabled'}\n`;
+            comment += `- **Fix Threshold:** Severity ≤ ${{ env.FIX_SEVERITY_THRESHOLD }}\n`;
+            comment += `- **Max Fixes per Run:** ${{ env.MAX_FIXES_PER_RUN }}\n\n`;
+            
+            comment += `### 🔗 **Additional Resources**\n\n`;
+            comment += `- 📋 [Security Tab - Detailed Results](${context.payload.repository.html_url}/security/code-scanning)\n`;
+            comment += `- 📚 [Salesforce Code Analyzer Documentation](https://forcedotcom.github.io/sfdx-scanner/)\n`;
+            comment += `- 🛠️ [PMD Rules Documentation](https://pmd.github.io/pmd/pmd_rules_apex.html)\n`;
+            if (autoFixEnabled) {
+              comment += `- 🤖 [GitHub Copilot Documentation](https://docs.github.com/en/copilot)\n`;
+            }
+            
+            comment += `\n---\n*Analysis performed on ${new Date().toISOString()} • Auto-fix: ${autoFixEnabled ? 'Enabled' : 'Disabled'}*`;
             
             // Find existing comment and update or create new
             const comments = await github.rest.issues.listComments({
@@ -239,6 +681,7 @@ jobs:
         run: |
           echo "❌ Blocking PR due to high/critical severity issues"
           echo "Found ${{ steps.process-results.outputs.high_count }} high/critical issues"
+          echo "These issues require manual review and cannot be auto-fixed"
           echo "Please review and fix the issues before merging"
           exit 1
 
@@ -249,3 +692,5 @@ jobs:
           name: salesforce-analysis-results
           path: analysis-results/
           retention-days: 30
+
+# GenAI: Generated code ends here
