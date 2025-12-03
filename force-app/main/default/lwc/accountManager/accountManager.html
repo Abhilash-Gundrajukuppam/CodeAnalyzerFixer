@@ -1,0 +1,62 @@
+<template>
+    <!-- LWC HTML template for account manager -->
+    <lightning-card title="Account Manager" icon-name="standard:account">
+        <div class="slds-p-around_medium">
+            <!-- Account count display -->
+            <div class="slds-text-heading_small slds-m-bottom_medium">
+                Total Accounts: {accountCount}
+            </div>
+            
+            <!-- Account list -->
+            <template if:true={accounts}>
+                <div class="account-list">
+                    <template for:each={accounts} for:item="account">
+                        <div key={account.Id} 
+                             class="account-item slds-box slds-m-bottom_small"
+                             data-account-id={account.Id}
+                             onclick={handleAccountClick}>
+                            
+                            <div class="slds-grid">
+                                <div class="slds-col slds-size_8-of-12">
+                                    <h3 class="slds-text-heading_small">{account.Name}</h3>
+                                    <p class="slds-text-body_regular">{account.Type}</p>
+                                </div>
+                                
+                                <div class="slds-col slds-size_4-of-12">
+                                    <template if:true={account.AnnualRevenue}>
+                                        <p class="slds-text-body_small">
+                                            Revenue: {account.AnnualRevenue}
+                                        </p>
+                                    </template>
+                                </div>
+                            </div>
+                        </div>
+                    </template>
+                </div>
+            </template>
+            
+            <!-- No accounts message -->
+            <template if:false={accounts}>
+                <div class="slds-text-align_center slds-p-vertical_large">
+                    <p class="slds-text-body_regular">No accounts found.</p>
+                </div>
+            </template>
+        </div>
+        
+        <!-- Footer with action buttons -->
+        <div slot="footer" class="slds-text-align_center">
+            <lightning-button 
+                label="Refresh" 
+                onclick={loadAccounts}
+                variant="brand">
+            </lightning-button>
+            
+            <lightning-button 
+                label="Do Random Stuff" 
+                onclick={doStuff}
+                variant="neutral"
+                class="slds-m-left_small">
+            </lightning-button>
+        </div>
+    </lightning-card>
+</template>
