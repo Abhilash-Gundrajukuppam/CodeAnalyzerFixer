@@ -5,7 +5,7 @@ name: Salesforce Code Analysis
 
 on:
   pull_request:
-    branches: [ main, develop ]
+    branches: [ main, development ]
     paths: 
       - 'force-app/**'
       - 'sfdx-project.json'
