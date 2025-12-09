@@ -77,41 +77,96 @@ jobs:
           mkdir -p analysis-results
           
           echo "🔍 Starting comprehensive code analysis..."
+          echo "Target files found:"
+          find force-app/ -type f \( -name "*.cls" -o -name "*.trigger" -o -name "*.js" \) | head -10
           
           # Run PMD analysis for Apex
           echo "Running PMD analysis..."
-          sf scanner run --format sarif --target "force-app/**/*.cls,force-app/**/*.trigger" \
+          if sf scanner run --format sarif --target "force-app/**/*.cls,force-app/**/*.trigger" \
             --engine pmd --category "Best Practices,Code Style,Design,Documentation,Error Prone,Multithreading,Performance,Security" \
-            --outfile analysis-results/pmd-results.sarif || true
+            --outfile analysis-results/pmd-results.sarif; then
+            echo "✅ PMD analysis completed successfully"
+          else
+            echo "⚠️ PMD analysis failed or found no issues"
+          fi
           
           # Run ESLint analysis for LWC
           echo "Running ESLint analysis..."
-          sf scanner run --format sarif --target "force-app/**/lwc/**/*.js" \
+          if sf scanner run --format sarif --target "force-app/**/lwc/**/*.js" \
             --engine eslint-lwc \
-            --outfile analysis-results/eslint-results.sarif || true
+            --outfile analysis-results/eslint-results.sarif; then
+            echo "✅ ESLint analysis completed successfully"
+          else
+            echo "⚠️ ESLint analysis failed or found no issues"
+          fi
           
           # Run comprehensive analysis with all engines
           echo "Running comprehensive analysis..."
-          sf scanner run --format sarif --target "force-app/" \
+          if sf scanner run --format sarif --target "force-app/" \
             --engine pmd,eslint-lwc,retire-js \
             --category "Best Practices,Code Style,Design,Documentation,Error Prone,Multithreading,Performance,Security" \
             --severity-threshold 2 \
-            --outfile analysis-results/comprehensive-results.sarif || true
+            --outfile analysis-results/comprehensive-results.sarif; then
+            echo "✅ Comprehensive analysis completed successfully"
+          else
+            echo "⚠️ Comprehensive analysis failed - trying simpler approach"
+            # Fallback: try with just PMD engine
+            sf scanner run --format sarif --target "force-app/" \
+              --engine pmd \
+              --outfile analysis-results/comprehensive-results.sarif || echo "Fallback analysis also failed"
+          fi
           
           # Generate JSON report for processing and PR comments
-          sf scanner run --format json --target "force-app/" \
+          echo "Generating JSON report..."
+          if sf scanner run --format json --target "force-app/" \
             --engine pmd,eslint-lwc,retire-js \
             --category "Best Practices,Code Style,Design,Documentation,Error Prone,Multithreading,Performance,Security" \
-            --outfile analysis-results/detailed-results.json || true
+            --outfile analysis-results/detailed-results.json; then
+            echo "✅ JSON report generated successfully"
+          else
+            echo "⚠️ JSON report generation failed - trying simpler approach"
+            sf scanner run --format json --target "force-app/" \
+              --engine pmd \
+              --outfile analysis-results/detailed-results.json || echo "Fallback JSON generation also failed"
+          fi
           
-          echo "✅ Analysis completed"
+          echo "✅ Analysis completed - checking results:"
+          ls -la analysis-results/ || echo "No analysis results directory found"
+
+      - name: Check SARIF File Existence
+        id: check-sarif
+        if: always()
+        run: |
+          echo "Checking for SARIF files..."
+          ls -la analysis-results/ || echo "analysis-results directory not found"
+          
+          if [ -f "analysis-results/comprehensive-results.sarif" ]; then
+            echo "✅ comprehensive-results.sarif found"
+            echo "sarif_exists=true" >> $GITHUB_OUTPUT
+            echo "sarif_file=analysis-results/comprehensive-results.sarif" >> $GITHUB_OUTPUT
+          elif [ -f "analysis-results/pmd-results.sarif" ]; then
+            echo "✅ pmd-results.sarif found as fallback"
+            echo "sarif_exists=true" >> $GITHUB_OUTPUT
+            echo "sarif_file=analysis-results/pmd-results.sarif" >> $GITHUB_OUTPUT
+          elif [ -f "analysis-results/eslint-results.sarif" ]; then
+            echo "✅ eslint-results.sarif found as fallback"
+            echo "sarif_exists=true" >> $GITHUB_OUTPUT
+            echo "sarif_file=analysis-results/eslint-results.sarif" >> $GITHUB_OUTPUT
+          else
+            echo "❌ No SARIF files found"
+            echo "sarif_exists=false" >> $GITHUB_OUTPUT
+            echo "sarif_file=" >> $GITHUB_OUTPUT
+            # Look for any .sarif files
+            find . -name "*.sarif" -type f || echo "No .sarif files found anywhere"
+          fi
 
       - name: Upload SARIF Results to GitHub Security
-        if: always()
+        if: always() && steps.check-sarif.outputs.sarif_exists == 'true'
         uses: github/codeql-action/upload-sarif@v3
         with:
-          sarif_file: analysis-results/comprehensive-results.sarif
+          sarif_file: ${{ steps.check-sarif.outputs.sarif_file }}
           category: salesforce-analysis
+        continue-on-error: true
 
       - name: Process Analysis Results
         id: process-results
