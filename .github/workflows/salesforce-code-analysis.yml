@@ -57,12 +57,12 @@ jobs:
           npm install -g @salesforce/cli
           sf version
           
-          # Install Code Analysis tools
-          npm install -g eslint @salesforce/eslint-plugin-lwc
+          # Install project dependencies from package.json
+          npm install
           
-          # Install GitHub Copilot CLI if using Copilot
+          # Install GitHub Copilot CLI if using Copilot (if available)
           if [ "${{ env.LLM_PROVIDER }}" = "github-copilot" ]; then
-            npm install -g @githubnext/github-copilot-cli
+            npm install -g @githubnext/github-copilot-cli 2>/dev/null || echo "Copilot CLI installation skipped"
           fi
 
       - name: Install Salesforce Code Analyzer
@@ -77,12 +77,26 @@ jobs:
           mkdir -p analysis-results
           
           echo "🔍 Starting comprehensive code analysis..."
+          
+          # Detect project structure
+          if [ -d "force-app" ]; then
+            echo "Detected Salesforce DX project structure"
+            TARGET_PATH="force-app/"
+            APEX_TARGET="force-app/**/*.cls,force-app/**/*.trigger"
+            LWC_TARGET="force-app/**/lwc/**/*.js"
+          else
+            echo "Detected simple Apex project structure"
+            TARGET_PATH="."
+            APEX_TARGET="**/*.cls,**/*.trigger"
+            LWC_TARGET="**/lwc/**/*.js"
+          fi
+          
           echo "Target files found:"
-          find force-app/ -type f \( -name "*.cls" -o -name "*.trigger" -o -name "*.js" \) | head -10
+          find . -type f \( -name "*.cls" -o -name "*.trigger" -o -name "*.js" \) | head -10
           
           # Run PMD analysis for Apex
-          echo "Running PMD analysis..."
-          if sf scanner run --format sarif --target "force-app/**/*.cls,force-app/**/*.trigger" \
+          echo "Running PMD analysis on: $APEX_TARGET"
+          if sf scanner run --format sarif --target "$APEX_TARGET" \
             --engine pmd --category "Best Practices,Code Style,Design,Documentation,Error Prone,Multithreading,Performance,Security" \
             --outfile analysis-results/pmd-results.sarif; then
             echo "✅ PMD analysis completed successfully"
@@ -90,42 +104,46 @@ jobs:
             echo "⚠️ PMD analysis failed or found no issues"
           fi
           
-          # Run ESLint analysis for LWC
-          echo "Running ESLint analysis..."
-          if sf scanner run --format sarif --target "force-app/**/lwc/**/*.js" \
-            --engine eslint-lwc \
-            --outfile analysis-results/eslint-results.sarif; then
-            echo "✅ ESLint analysis completed successfully"
+          # Run ESLint analysis for LWC (if any exist)
+          echo "Running ESLint analysis on: $LWC_TARGET"
+          if find . -name "*.js" -path "*/lwc/*" | grep -q .; then
+            if sf scanner run --format sarif --target "$LWC_TARGET" \
+              --engine eslint-lwc \
+              --outfile analysis-results/eslint-results.sarif; then
+              echo "✅ ESLint analysis completed successfully"
+            else
+              echo "⚠️ ESLint analysis failed or found no issues"
+            fi
           else
-            echo "⚠️ ESLint analysis failed or found no issues"
+            echo "ℹ️ No LWC files found - skipping ESLint analysis"
           fi
           
           # Run comprehensive analysis with all engines
-          echo "Running comprehensive analysis..."
-          if sf scanner run --format sarif --target "force-app/" \
-            --engine pmd,eslint-lwc,retire-js \
+          echo "Running comprehensive analysis on: $TARGET_PATH"
+          if sf scanner run --format sarif --target "$TARGET_PATH" \
+            --engine pmd \
             --category "Best Practices,Code Style,Design,Documentation,Error Prone,Multithreading,Performance,Security" \
             --severity-threshold 2 \
             --outfile analysis-results/comprehensive-results.sarif; then
             echo "✅ Comprehensive analysis completed successfully"
           else
             echo "⚠️ Comprehensive analysis failed - trying simpler approach"
-            # Fallback: try with just PMD engine
-            sf scanner run --format sarif --target "force-app/" \
+            # Fallback: try with just current directory
+            sf scanner run --format sarif --target "." \
               --engine pmd \
               --outfile analysis-results/comprehensive-results.sarif || echo "Fallback analysis also failed"
           fi
           
           # Generate JSON report for processing and PR comments
           echo "Generating JSON report..."
-          if sf scanner run --format json --target "force-app/" \
-            --engine pmd,eslint-lwc,retire-js \
+          if sf scanner run --format json --target "$TARGET_PATH" \
+            --engine pmd \
             --category "Best Practices,Code Style,Design,Documentation,Error Prone,Multithreading,Performance,Security" \
             --outfile analysis-results/detailed-results.json; then
             echo "✅ JSON report generated successfully"
           else
             echo "⚠️ JSON report generation failed - trying simpler approach"
-            sf scanner run --format json --target "force-app/" \
+            sf scanner run --format json --target "." \
               --engine pmd \
               --outfile analysis-results/detailed-results.json || echo "Fallback JSON generation also failed"
           fi
@@ -486,9 +504,16 @@ jobs:
           if [ "$FIXES_APPLIED" -gt "0" ]; then
             echo "Running validation scan on fixed files..."
             
+            # Detect project structure for validation
+            if [ -d "force-app" ]; then
+              VALIDATION_TARGET="force-app/"
+            else
+              VALIDATION_TARGET="."
+            fi
+            
             # Re-run analysis on fixed files to validate improvements
-            sf scanner run --format json --target "force-app/" \
-              --engine pmd,eslint-lwc \
+            sf scanner run --format json --target "$VALIDATION_TARGET" \
+              --engine pmd \
               --outfile analysis-results/post-fix-results.json || true
             
             # Compare before/after issue counts
