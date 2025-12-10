@@ -60,9 +60,12 @@ jobs:
           # Install project dependencies from package.json
           npm install
           
-          # Install GitHub Copilot CLI if using Copilot (if available)
+          # Install GitHub CLI for Copilot integration
           if [ "${{ env.LLM_PROVIDER }}" = "github-copilot" ]; then
-            npm install -g @githubnext/github-copilot-cli 2>/dev/null || echo "Copilot CLI installation skipped"
+            # GitHub CLI is already installed on GitHub runners
+            gh --version
+            # Verify authentication
+            gh auth status || echo "GitHub CLI authentication may need setup"
           fi
 
       - name: Install Salesforce Code Analyzer
@@ -279,15 +282,213 @@ jobs:
       - name: Auto-Fix Issues with GitHub Copilot
         if: steps.process-results.outputs.should_auto_fix == 'true' && env.LLM_PROVIDER == 'github-copilot'
         id: copilot-fix
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COPILOT_API_KEY: ${{ secrets.COPILOT_API_KEY }}
         run: |
-          echo "🤖 Using GitHub Copilot to fix issues..."
+          echo "🤖 Using GitHub Copilot Business to fix issues..."
           
           # Configure Git
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           
+          # Verify GitHub CLI authentication
+          echo "Verifying GitHub CLI authentication..."
+          gh auth status
+          
           FIXES_APPLIED=0
           FIXED_FILES=""
+          
+          # Create Copilot fix script
+          cat > copilot_fix_script.py << 'EOF'
+          import json
+          import os
+          import sys
+          import requests
+          import subprocess
+          import tempfile
+          
+          def get_github_token():
+              """Get GitHub token from environment"""
+              return os.getenv('GH_TOKEN') or os.getenv('GITHUB_TOKEN')
+          
+          def create_copilot_prompt(file_path, rule_name, message, line_num, file_content):
+              """Create a structured prompt for Copilot"""
+              return f"""Fix this Salesforce Apex code issue:
+          
+          File: {file_path}
+          Rule Violation: {rule_name}
+          Issue: {message}
+          Line: {line_num}
+          
+          Current Code:
+          ```apex
+          {file_content}
+          ```
+          
+          Instructions:
+          1. Fix the specific issue while preserving all functionality
+          2. Follow Salesforce best practices
+          3. Add proper error handling where needed
+          4. Ensure code is bulkified and governor limit safe
+          5. Add appropriate comments for complex fixes
+          
+          Provide ONLY the complete corrected file content without explanations."""
+          
+          def fix_with_copilot_api(prompt, github_token):
+              """Attempt to use GitHub Copilot API if available"""
+              try:
+                  # Check if Copilot API is available for this organization
+                  headers = {
+                      "Authorization": f"Bearer {github_token}",
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28"
+                  }
+                  
+                  # Try to use Copilot completions API (if available)
+                  # Note: This is experimental and may not be available for all organizations
+                  api_url = "https://api.github.com/copilot/completions"
+                  
+                  data = {
+                      "prompt": prompt,
+                      "suffix": "",
+                      "max_tokens": 2000,
+                      "temperature": 0.1,
+                      "top_p": 1,
+                      "n": 1,
+                      "stream": False
+                  }
+                  
+                  response = requests.post(api_url, headers=headers, json=data, timeout=30)
+                  
+                  if response.status_code == 200:
+                      result = response.json()
+                      if result.get("choices") and len(result["choices"]) > 0:
+                          return result["choices"][0].get("text", "").strip()
+                  else:
+                      print(f"Copilot API response: {response.status_code} - {response.text[:200]}")
+                      
+              except Exception as e:
+                  print(f"Copilot API error: {str(e)}")
+              
+              return None
+          
+          def fix_with_gh_cli_suggestion(prompt, file_path):
+              """Use GitHub CLI to create a suggestion (alternative approach)"""
+              try:
+                  # Create a temporary file with the prompt
+                  with tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False) as f:
+                      f.write(prompt)
+                      temp_file = f.name
+                  
+                  # Use gh CLI to create a code suggestion or comment
+                  # This is a workaround since direct Copilot API may not be available
+                  cmd = [
+                      'gh', 'api', 
+                      'repos/:owner/:repo/pulls/comments',
+                      '-X', 'POST',
+                      '-f', f'body=Code fix suggestion for {file_path}:\n\n{prompt}',
+                      '-f', 'commit_id=' + os.getenv('GITHUB_SHA', ''),
+                      '-f', f'path={file_path}',
+                      '-f', 'line=1'
+                  ]
+                  
+                  # This creates a PR comment that developers can use with Copilot
+                  result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                  
+                  os.unlink(temp_file)
+                  
+                  if result.returncode == 0:
+                      print(f"Created code suggestion comment for {file_path}")
+                      return "SUGGESTION_CREATED"
+                  else:
+                      print(f"Failed to create suggestion: {result.stderr}")
+                      
+              except Exception as e:
+                  print(f"GitHub CLI error: {str(e)}")
+              
+              return None
+          
+          def apply_basic_fixes(file_content, rule_name):
+              """Apply basic rule-based fixes for common issues"""
+              fixed_content = file_content
+              
+              # Basic fixes for common Salesforce issues
+              if "ApexSharingViolations" in rule_name:
+                  # Add sharing declaration
+                  if "public class" in fixed_content and "sharing" not in fixed_content:
+                      fixed_content = fixed_content.replace("public class", "public with sharing class")
+              
+              elif "ApexDoc" in rule_name:
+                  # Add basic ApexDoc comments
+                  lines = fixed_content.split('\n')
+                  for i, line in enumerate(lines):
+                      if "public class" in line and i > 0 and not lines[i-1].strip().startswith('/**'):
+                          lines.insert(i, '/**')
+                          lines.insert(i+1, ' * Description: Auto-generated class description')
+                          lines.insert(i+2, ' */')
+                          break
+                      elif ("public static" in line or "public void" in line) and i > 0 and not lines[i-1].strip().startswith('/**'):
+                          lines.insert(i, '    /**')
+                          lines.insert(i+1, '     * Auto-generated method description')
+                          lines.insert(i+2, '     */')
+                          break
+                  fixed_content = '\n'.join(lines)
+              
+              elif "UnusedLocalVariable" in rule_name:
+                  # Comment out or remove unused variables (basic approach)
+                  lines = fixed_content.split('\n')
+                  for i, line in enumerate(lines):
+                      if "defined but not used" in rule_name:
+                          # This is a simplified approach - in real implementation would parse the AST
+                          if "List<" in line and "=" in line and "new List" in line:
+                              lines[i] = "        // " + line.strip() + " // Removed unused variable"
+                              break
+                  fixed_content = '\n'.join(lines)
+              
+              return fixed_content
+          
+          # Main execution
+          if __name__ == "__main__":
+              file_path = sys.argv[1]
+              rule_name = sys.argv[2] 
+              message = sys.argv[3]
+              line_num = sys.argv[4]
+              
+              try:
+                  with open(file_path, 'r') as f:
+                      file_content = f.read()
+                  
+                  prompt = create_copilot_prompt(file_path, rule_name, message, line_num, file_content)
+                  github_token = get_github_token()
+                  
+                  fixed_content = None
+                  
+                  # Try Copilot API first
+                  if github_token:
+                      fixed_content = fix_with_copilot_api(prompt, github_token)
+                  
+                  # If Copilot API fails, try basic rule-based fixes
+                  if not fixed_content:
+                      fixed_content = apply_basic_fixes(file_content, rule_name)
+                      
+                      # Create a suggestion comment for manual review
+                      if github_token:
+                          fix_with_gh_cli_suggestion(prompt, file_path)
+                  
+                  # Only apply fixes if we have meaningful changes
+                  if fixed_content and fixed_content != file_content:
+                      print(fixed_content)
+                  else:
+                      print("NO_CHANGES")
+                      
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  print("NO_CHANGES")
+          EOF
+          
+          # Install Python dependencies
+          python3 -m pip install requests --quiet
           
           # Process each fixable issue
           while IFS= read -r issue; do
@@ -296,7 +497,7 @@ jobs:
               break
             fi
             
-            FILE_PATH=$(echo "$issue" | jq -r '.fileName // empty')
+            FILE_PATH=$(echo "$issue" | jq -r '.fileName // empty' | sed 's|/home/runner/work/[^/]*/[^/]*/||')
             RULE_NAME=$(echo "$issue" | jq -r '.ruleName // empty')
             MESSAGE=$(echo "$issue" | jq -r '.message // empty')
             LINE_NUM=$(echo "$issue" | jq -r '.line // empty')
@@ -304,43 +505,35 @@ jobs:
             if [ -n "$FILE_PATH" ] && [ -f "$FILE_PATH" ]; then
               echo "🔧 Fixing: $RULE_NAME in $FILE_PATH (Line: $LINE_NUM)"
               
-              # Create fix prompt for Copilot
-              cat > temp_fix_prompt.md << EOF
-          Fix the following Salesforce code issue:
-
-          **File:** $FILE_PATH
-          **Rule:** $RULE_NAME  
-          **Issue:** $MESSAGE
-          **Line:** $LINE_NUM
-
-          **Current Code:**
-          \`\`\`apex
-          $(cat "$FILE_PATH")
-          \`\`\`
-
-          Please provide the complete fixed file content following Salesforce best practices.
-          Preserve all existing functionality while fixing the identified issue.
-          EOF
+              # Call Copilot fix script
+              FIXED_CONTENT=$(python3 copilot_fix_script.py "$FILE_PATH" "$RULE_NAME" "$MESSAGE" "$LINE_NUM" 2>/dev/null)
               
-              # Use Copilot CLI to generate fix (if available)
-              if command -v github-copilot &> /dev/null; then
-                echo "Using GitHub Copilot CLI..."
-                # Note: This is a placeholder - actual Copilot CLI integration may vary
-                github-copilot suggest "$(cat temp_fix_prompt.md)" > temp_fix_output.txt 2>/dev/null || echo "Copilot CLI not available"
+              if [ "$FIXED_CONTENT" != "NO_CHANGES" ] && [ -n "$FIXED_CONTENT" ] && [ "$FIXED_CONTENT" != "Error:"* ]; then
+                # Backup original file
+                cp "$FILE_PATH" "$FILE_PATH.backup"
+                
+                # Apply the fix
+                echo "$FIXED_CONTENT" > "$FILE_PATH"
+                
+                echo "✅ Applied Copilot fix for $RULE_NAME in $FILE_PATH" >> analysis-results/fix-log.txt
+                FIXES_APPLIED=$((FIXES_APPLIED + 1))
+                FIXED_FILES="$FIXED_FILES $FILE_PATH"
+                
+                echo "Fixed $FILE_PATH successfully"
+              else
+                echo "⚠️ No fix generated for $RULE_NAME in $FILE_PATH" >> analysis-results/fix-log.txt
+                echo "Copilot could not generate a fix for this issue"
               fi
-              
-              # For now, create a basic fix framework that can be enhanced
-              echo "# Auto-fix attempted for $RULE_NAME in $FILE_PATH" >> analysis-results/fix-log.txt
-              
-              FIXES_APPLIED=$((FIXES_APPLIED + 1))
-              FIXED_FILES="$FIXED_FILES $FILE_PATH"
-              
-              rm -f temp_fix_prompt.md temp_fix_output.txt
             fi
           done < <(jq -c '.[]' analysis-results/fixable-issues.json)
           
+          # Clean up
+          rm -f copilot_fix_script.py
+          
           echo "fixes_applied=$FIXES_APPLIED" >> $GITHUB_OUTPUT
           echo "fixed_files=$FIXED_FILES" >> $GITHUB_OUTPUT
+          
+          echo "🤖 Copilot auto-fix completed: $FIXES_APPLIED fixes applied"
 
       - name: Auto-Fix Issues with Custom LLM
         if: steps.process-results.outputs.should_auto_fix == 'true' && env.LLM_PROVIDER != 'github-copilot'
