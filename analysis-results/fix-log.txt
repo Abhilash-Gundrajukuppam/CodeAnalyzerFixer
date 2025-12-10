@@ -1,0 +1,1 @@
+# Auto-fix attempted for  in /home/runner/work/CodeAnalyzerFixer/CodeAnalyzerFixer/TestClass.cls
